@@ -1,5 +1,9 @@
 # Port Patrol 🛡️
 
+![Port Patrol Screenshots](img-1.png)
+![Port Patrol Screenshots](img-2.png)
+![Port Patrol Demo](output.gif)
+
 **Port Patrol** is a native macOS menu bar application that gives you instant visibility into all open network ports and the processes running them. It's designed for developers who need to know *what* is running on port 8080/3000/5432 and *why*.
 
 ## Features
@@ -40,6 +44,7 @@ Port Patrol is a developer tool and is not sandboxed (it requires access to `lso
 
 ### Build Steps
 
+#### Using Xcode
 1. Clone the repository:
    ```bash
    git clone https://github.com/yourusername/port-patrol.git
@@ -55,10 +60,27 @@ Port Patrol is a developer tool and is not sandboxed (it requires access to `lso
    - Select the **PortPatrol** scheme.
    - Press `Cmd + R`.
 
+#### Command Line Build
+To quickly verify the build status or perform a clean build from the terminal, use the following command. It outputs only build errors or the final success message:
+
+```bash
+xcodebuild -project PortPatrol.xcodeproj -scheme PortPatrol -configuration Debug build 2>&1 | grep -E "error:|BUILD" | tail -5
+```
+
 4. (Optional) Archive for local use:
    - Go to `Product -> Archive`.
    - Choose "Distribute App" -> "Copy App".
    - Move `PortPatrol.app` to your `/Applications` folder.
+
+## Troubleshooting
+
+- **"App hangs when clicking Terminate"**: Fixed in v1.1 by replacing native alerts with custom overlays to respect `MenuBarExtra` lifecycle.
+- **"Port 8000 not showing"**: Fixed in v1.1 with corrected `lsof` field parsing order.
+
+## License
+
+MIT License. Free to use and modify.
+
 
 ## Troubleshooting
 
