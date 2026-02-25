@@ -1,7 +1,9 @@
 import Foundation
 
 struct PortInfo: Identifiable, Hashable {
-    var id: String { "\(pid):\(port):\(transportProtocol):\(state)" }
+    // Use address instead of state so the ID is stable across TCP state transitions
+    // (e.g. ESTABLISHED → CLOSE_WAIT won't destroy/recreate the SwiftUI row)
+    var id: String { "\(pid):\(port):\(transportProtocol):\(address)" }
     let port: Int
     let pid: Int
     let processName: String

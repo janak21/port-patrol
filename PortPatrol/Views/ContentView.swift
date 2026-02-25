@@ -167,14 +167,17 @@ struct ContentView: View {
                 Button {
                     portScanner.toggleAutoRefresh()
                 } label: {
-                    Image(systemName: portScanner.autoRefreshEnabled ? "arrow.triangle.2.circlepath" : "arrow.triangle.2.circlepath")
+                    // Different icons make the state immediately readable at a glance.
+                    // Simple opacity dim replaces the repeatForever animation, which could
+                    // get stuck looping after isScanning returns to false.
+                    Image(systemName: portScanner.autoRefreshEnabled ? "arrow.triangle.2.circlepath" : "pause.circle")
                         .font(.caption)
                         .foregroundColor(portScanner.autoRefreshEnabled ? .green : .secondary)
-                        .opacity(portScanner.isScanning && portScanner.autoRefreshEnabled ? 0.4 : 1.0)
-                        .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: portScanner.isScanning)
+                        .opacity(portScanner.isScanning ? 0.4 : 1.0)
+                        .animation(.easeInOut(duration: 0.3), value: portScanner.isScanning)
                 }
                 .buttonStyle(.plain)
-                .help(portScanner.autoRefreshEnabled ? "Auto-refresh ON (3s)" : "Auto-refresh OFF")
+                .help(portScanner.autoRefreshEnabled ? "Auto-refresh ON (\(Int(portScanner.refreshInterval))s)" : "Auto-refresh OFF")
 
                 // Manual refresh
                 Button {
@@ -269,9 +272,11 @@ struct ContentView: View {
     }
 
     private func countForTab(_ tab: PortTab) -> Int {
+        // Use pre-computed counts (filter only, no sort) instead of calling
+        // listeningPorts/establishedPorts which each run a filter+sort on every render.
         switch tab {
-        case .listening: return portScanner.listeningPorts.count
-        case .established: return portScanner.establishedPorts.count
+        case .listening: return portScanner.listeningCount
+        case .established: return portScanner.establishedCount
         case .all: return portScanner.ports.count
         }
     }
@@ -317,8 +322,8 @@ struct ContentView: View {
                     Circle()
                         .fill(portScanner.autoRefreshEnabled ? .green : .orange)
                         .frame(width: 6, height: 6)
-                        .opacity(portScanner.isScanning ? 0.5 : 1.0)
-                        .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: portScanner.isScanning)
+                        .opacity(portScanner.isScanning ? 0.4 : 1.0)
+                        .animation(.easeInOut(duration: 0.3), value: portScanner.isScanning)
 
                     Text("Updated \(time.formatted(.dateTime.hour().minute().second()))")
                         .font(.caption2)

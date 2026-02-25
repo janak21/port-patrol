@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 
 @Observable
 final class PortScanner {
@@ -13,6 +12,10 @@ final class PortScanner {
 
     var listeningCount: Int {
         ports.filter(\.isListening).count
+    }
+
+    var establishedCount: Int {
+        ports.filter { !$0.isListening }.count
     }
 
     var listeningPorts: [PortInfo] {
@@ -37,9 +40,13 @@ final class PortScanner {
     func startAutoRefresh() {
         stopAutoRefresh()
         guard autoRefreshEnabled else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        // Explicitly schedule on RunLoop.main so the timer fires regardless of
+        // which thread calls startAutoRefresh().
+        let t = Timer(timeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.scan()
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func stopAutoRefresh() {
@@ -57,17 +64,27 @@ final class PortScanner {
     }
 
     func scan() {
+        // Guard against concurrent scans: if a scan is already in-flight, skip this request.
+        guard !isScanning else { return }
         isScanning = true
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var results = Self.runLsof()
-            // Enrich with intelligence data
+
+            // Batch-fetch intelligence for all unique PIDs.
+            // Previously this spawned 5 subprocesses per PID (N×5 total).
+            // Now it uses 2 subprocess calls total regardless of the number of PIDs.
+            let uniquePIDs = Set(results.map { $0.pid })
+            let processNames = Dictionary(
+                results.map { ($0.pid, $0.processName) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let intelMap = ProcessIntelligence.batchAnalyze(pids: uniquePIDs, processNames: processNames)
+
             for i in results.indices {
-                results[i].intelligence = ProcessIntelligence.analyze(
-                    processName: results[i].processName,
-                    pid: results[i].pid
-                )
+                results[i].intelligence = intelMap[results[i].pid]
             }
+
             DispatchQueue.main.async {
                 self?.ports = results
                 self?.lastScanTime = Date()
@@ -191,9 +208,6 @@ final class PortScanner {
         guard let lastColon = name.lastIndex(of: ":") else { return nil }
         let portString = String(name[name.index(after: lastColon)...])
         guard let port = Int(portString), port > 0 else { return nil }
-
-        // Skip very low-level system ports (like mDNSResponder on 5353) unless they're common dev ports
-        // Actually, show everything and let the user filter
 
         let displayState = state.isEmpty ? (proto == "UDP" ? "UDP" : "UNKNOWN") : state
 

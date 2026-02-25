@@ -4,7 +4,7 @@ import Foundation
 /// whether they're safe to kill, and what depends on them.
 enum ProcessIntelligence {
 
-    // MARK: - Process Info Gathering
+    // MARK: - Data Types
 
     struct ProcessDetail {
         let parentName: String
@@ -14,8 +14,8 @@ enum ProcessIntelligence {
         let description: String
         let category: ProcessCategory
         let safetyLevel: SafetyLevel
-        let dependents: [String]        // processes that depend on this one
-        let explanation: String          // human-friendly "why is this running?"
+        let dependents: [String]
+        let explanation: String
     }
 
     enum ProcessCategory: String {
@@ -42,20 +42,6 @@ enum ProcessIntelligence {
             case .unknown: return "questionmark.circle"
             }
         }
-
-        var color: String {
-            switch self {
-            case .database: return "purple"
-            case .webServer: return "blue"
-            case .devTool: return "orange"
-            case .aiTool: return "pink"
-            case .languageRuntime: return "green"
-            case .systemService: return "gray"
-            case .container: return "cyan"
-            case .networking: return "teal"
-            case .unknown: return "secondary"
-            }
-        }
     }
 
     enum SafetyLevel: String {
@@ -80,7 +66,7 @@ enum ProcessIntelligence {
         }
     }
 
-    // MARK: - Caching
+    // MARK: - Cache (thread-safe via NSLock)
 
     private struct CacheEntry {
         let detail: ProcessDetail
@@ -88,107 +74,165 @@ enum ProcessIntelligence {
     }
 
     private static var cache: [Int: CacheEntry] = [:]
-    private static let cacheTTL: TimeInterval = 30.0 // Cache for 30 seconds
+    private static let cacheLock = NSLock()
+    private static let cacheTTL: TimeInterval = 30.0
 
-    // MARK: - Gather Intelligence
+    // MARK: - Batch Analysis
 
-    static func analyze(processName: String, pid: Int) -> ProcessDetail {
-        // Check cache
-        if let entry = cache[pid], Date().timeIntervalSince(entry.timestamp) < cacheTTL {
-            // Even if cached, we might want to verify the process name hasn't changed (PID recycling)
-            // But for 30s TTL, it's acceptable risk for a UI tool.
-            return entry.detail
+    /// Analyzes a set of PIDs using exactly 2 subprocess calls total (one `ps -eo` for the full
+    /// process table, one `ps -o command=` for full command strings). Previously the code spawned
+    /// 5 subprocesses per PID; this version is O(1) subprocesses regardless of the number of PIDs.
+    ///
+    /// Must be called from a background thread.
+    static func batchAnalyze(pids: Set<Int>, processNames: [Int: String]) -> [Int: ProcessDetail] {
+        let now = Date()
+
+        // Separate cached vs uncached PIDs (under lock)
+        var result: [Int: ProcessDetail] = [:]
+        var uncached: [Int] = []
+
+        cacheLock.lock()
+        for pid in pids {
+            if let entry = cache[pid], now.timeIntervalSince(entry.timestamp) < cacheTTL {
+                result[pid] = entry.detail
+            } else {
+                uncached.append(pid)
+            }
+        }
+        cacheLock.unlock()
+
+        guard !uncached.isEmpty else { return result }
+
+        // Fetch raw info and dependents for all uncached PIDs in 2 ps calls
+        let (rawInfoMap, dependentsMap) = batchFetchAll(pids: uncached)
+
+        // Build ProcessDetail for each uncached PID
+        var newEntries: [Int: CacheEntry] = [:]
+        for pid in uncached {
+            let processName = processNames[pid] ?? ""
+            let raw = rawInfoMap[pid] ?? (ppid: 0, parentName: "Unknown", user: "Unknown", command: "Unknown")
+            let deps = dependentsMap[pid] ?? []
+
+            let known = knowledgeBase[processName.lowercased()]
+            let category = known?.category ?? guessCategory(processName: processName, command: raw.command)
+            let safety = known?.safety ?? guessSafety(processName: processName, user: raw.user)
+            let description = known?.description ?? "Process: \(processName)"
+            let explanation = buildExplanation(
+                processName: processName,
+                description: description,
+                parentName: raw.parentName,
+                category: category,
+                fullCommand: raw.command,
+                user: raw.user,
+                dependents: deps
+            )
+
+            let detail = ProcessDetail(
+                parentName: raw.parentName,
+                parentPID: raw.ppid,
+                fullCommand: raw.command,
+                user: raw.user,
+                description: description,
+                category: category,
+                safetyLevel: safety,
+                dependents: deps,
+                explanation: explanation
+            )
+
+            result[pid] = detail
+            newEntries[pid] = CacheEntry(detail: detail, timestamp: now)
         }
 
-        // Fetch raw info in one go
-        let rawInfo = getRawProcessInfo(pid: pid)
-        
-        let dependents = getDependentProcesses(pid: pid) // This still needs a separate call
-        let knownInfo = knowledgeBase[processName.lowercased()]
-        let category = knownInfo?.category ?? guessCategory(processName: processName, command: rawInfo.command)
-        let safetyLevel = knownInfo?.safety ?? guessSafety(processName: processName, user: rawInfo.user)
-        let description = knownInfo?.description ?? "Process: \(processName)"
-        let explanation = buildExplanation(
-            processName: processName,
-            description: description,
-            parentName: rawInfo.parentName,
-            category: category,
-            fullCommand: rawInfo.command,
-            user: rawInfo.user,
-            dependents: dependents
-        )
-
-        let detail = ProcessDetail(
-            parentName: rawInfo.parentName,
-            parentPID: rawInfo.ppid,
-            fullCommand: rawInfo.command,
-            user: rawInfo.user,
-            description: description,
-            category: category,
-            safetyLevel: safetyLevel,
-            dependents: dependents,
-            explanation: explanation
-        )
-
-        // Update cache
-        cache[pid] = CacheEntry(detail: detail, timestamp: Date())
-
-        // Periodic cleanup: if cache grows too large, remove stale entries
+        // Write new entries to cache (under lock), then evict stale entries if needed
+        cacheLock.lock()
+        for (pid, entry) in newEntries {
+            cache[pid] = entry
+        }
         if cache.count > 200 {
-            let now = Date()
-            let staleThreshold = 60.0 // 1 minute
-            for (key, value) in cache {
-                if now.timeIntervalSince(value.timestamp) > staleThreshold {
-                    cache.removeValue(forKey: key)
-                }
+            cache = cache.filter { now.timeIntervalSince($0.value.timestamp) <= 60.0 }
+        }
+        cacheLock.unlock()
+
+        return result
+    }
+
+    // MARK: - System Queries (2 subprocess calls total)
+
+    /// Fetches raw process info AND dependents for all given PIDs using:
+    ///   • 1 call to `ps -eo pid,ppid,user,comm` — reads the full process table once.
+    ///     Used for: ppid, user, short name, parent name, and child-process discovery.
+    ///   • 1 call to `ps -o pid,command -p <pids>` — full command strings for our target PIDs.
+    private static func batchFetchAll(pids: [Int]) -> (
+        rawInfo: [Int: (ppid: Int, parentName: String, user: String, command: String)],
+        dependents: [Int: [String]]
+    ) {
+        guard !pids.isEmpty else { return ([:], [:]) }
+
+        let pidSet = Set(pids)
+        let pidList = pids.map { String($0) }.joined(separator: ",")
+
+        // Call 1: full process table (all running processes)
+        // Fields: pid, ppid, user, comm (short name ≤ 16 chars, no spaces for daemons)
+        let tableOutput = runCommand("/bin/ps", arguments: ["-eo", "pid=,ppid=,user=,comm="])
+
+        struct ProcRow { let ppid: Int; let user: String; let comm: String }
+        var table: [Int: ProcRow] = [:]
+
+        for line in tableOutput.components(separatedBy: "\n") {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 4,
+                  let pid = Int(parts[0]),
+                  let ppid = Int(parts[1]) else { continue }
+            let user = String(parts[2])
+            // Join remaining parts in case comm has internal spaces (rare but safe)
+            let comm = parts.dropFirst(3).joined(separator: " ")
+            table[pid] = ProcRow(ppid: ppid, user: user, comm: comm)
+        }
+
+        // Call 2: full command lines for our target PIDs only
+        // Parsing: first whitespace-delimited token is the pid, the rest is the command (may have spaces)
+        let cmdOutput = runCommand("/bin/ps", arguments: ["-o", "pid=,command=", "-p", pidList])
+        var commandMap: [Int: String] = [:]
+
+        for line in cmdOutput.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty,
+                  let spaceIdx = trimmed.firstIndex(of: " ") else { continue }
+            if let pid = Int(trimmed[trimmed.startIndex..<spaceIdx]) {
+                commandMap[pid] = String(trimmed[trimmed.index(after: spaceIdx)...])
+                    .trimmingCharacters(in: .whitespaces)
             }
         }
 
-        return detail
-    }
-
-    // MARK: - System Queries
-
-    private static func getRawProcessInfo(pid: Int) -> (ppid: Int, parentName: String, user: String, command: String) {
-        // Fetch ppid
-        let ppidStr = runCommand("/bin/ps", arguments: ["-o", "ppid=", "-p", "\(pid)"])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let ppid = Int(ppidStr) ?? 0
-
-        // Fetch user
-        let user = runCommand("/bin/ps", arguments: ["-o", "user=", "-p", "\(pid)"])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Fetch full command
-        let command = runCommand("/bin/ps", arguments: ["-o", "command=", "-p", "\(pid)"])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Resolve parent name
-        var parentName = "Unknown"
-        if ppid > 0 {
-            let pName = runCommand("/bin/ps", arguments: ["-o", "comm=", "-p", "\(ppid)"])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !pName.isEmpty {
-                parentName = (pName as NSString).lastPathComponent
+        // Assemble rawInfo for target PIDs
+        var rawInfo: [Int: (ppid: Int, parentName: String, user: String, command: String)] = [:]
+        for pid in pids {
+            guard let row = table[pid] else { continue }
+            let parentName: String
+            if row.ppid > 0, let parentRow = table[row.ppid] {
+                parentName = (parentRow.comm as NSString).lastPathComponent
+            } else {
+                parentName = "Unknown"
             }
+            let cmd = commandMap[pid]?.isEmpty == false ? commandMap[pid]! : row.comm
+            rawInfo[pid] = (
+                row.ppid,
+                parentName,
+                row.user.isEmpty ? "Unknown" : row.user,
+                cmd
+            )
         }
 
-        return (
-            ppid,
-            parentName,
-            user.isEmpty ? "Unknown" : user,
-            command.isEmpty ? "Unknown" : command
-        )
-    }
+        // Derive dependents from the process table: find all processes whose ppid is one of our targets.
+        // This replaces per-PID `pgrep -P` calls and gives us dependents in a single pass.
+        var dependents: [Int: [String]] = Dictionary(uniqueKeysWithValues: pids.map { ($0, [String]()) })
+        for (childPID, row) in table {
+            guard !pidSet.contains(childPID), pidSet.contains(row.ppid) else { continue }
+            let childComm = (row.comm as NSString).lastPathComponent
+            dependents[row.ppid, default: []].append(childComm)
+        }
 
-    private static func getDependentProcesses(pid: Int) -> [String] {
-        let output = runCommand("/bin/ps", arguments: ["-o", "comm=", "--ppid", "\(pid)"])
-        let children = output
-            .components(separatedBy: "\n")
-            .map { ($0.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).lastPathComponent }
-            .filter { !$0.isEmpty }
-            .filter { $0 != "ps" } // Exclude the ps command itself if it shows up
-        return children
+        return (rawInfo, dependents)
     }
 
     private static func runCommand(_ path: String, arguments: [String]) -> String {
@@ -221,27 +265,22 @@ enum ProcessIntelligence {
     ) -> String {
         var parts: [String] = []
 
-        // What is it?
         parts.append("📦 \(description)")
 
-        // Who started it?
         if parentName != "Unknown" && parentName != processName {
             parts.append("🚀 Started by: \(parentName)")
         }
 
-        // Running as?
         if user != "Unknown" {
             parts.append("👤 Running as: \(user)")
         }
 
-        // What depends on it?
         if !dependents.isEmpty {
             let depList = dependents.prefix(5).joined(separator: ", ")
             let extra = dependents.count > 5 ? " (+\(dependents.count - 5) more)" : ""
             parts.append("🔗 Used by: \(depList)\(extra)")
         }
 
-        // Should I keep it?
         switch category {
         case .database:
             parts.append("💡 This is a database. Other apps may depend on it. Stop only if you're sure nothing needs it.")
