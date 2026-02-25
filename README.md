@@ -68,7 +68,7 @@ Port Patrol is a developer tool and is not sandboxed (it requires access to `lso
 #### Using Xcode
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/port-patrol.git
+   git clone https://github.com/janak21/port-patrol.git
    cd port-patrol
    ```
 
